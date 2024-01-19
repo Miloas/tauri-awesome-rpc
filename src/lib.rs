@@ -1,14 +1,58 @@
 use jsonrpc_ws_server::jsonrpc_core::{serde::Serialize, *};
 use jsonrpc_ws_server::*;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
-use tauri::api::ipc::CallbackFn;
-use tauri::{AppHandle, InvokePayload, InvokeResponder, InvokeResponse, Manager, Runtime, Window};
+use serde_json::Value as JsonValue;
+use tauri::http;
+use tauri::ipc::CallbackFn;
+use tauri::ipc::InvokeBody;
+use tauri::ipc::InvokeResponder;
+use tauri::ipc::InvokeResponse;
+use tauri::window::InvokeRequest;
+use tauri::{AppHandle, Manager, Runtime, Window};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct InvokeRpcParams {
+  id: usize,
   window_label: String,
   payload: String,
+}
+
+struct HeaderMap(http::HeaderMap);
+
+impl<'de> Deserialize<'de> for HeaderMap {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let map = std::collections::HashMap::<String, String>::deserialize(deserializer)?;
+    let mut headers = http::HeaderMap::default();
+    for (key, value) in map {
+      if let (Ok(key), Ok(value)) = (
+        http::HeaderName::from_bytes(key.as_bytes()),
+        http::HeaderValue::from_str(&value),
+      ) {
+        headers.insert(key, value);
+      } else {
+        return Err(serde::de::Error::custom(format!(
+          "invalid header `{key}` `{value}`"
+        )));
+      }
+    }
+    Ok(Self(headers))
+  }
+}
+#[derive(Deserialize)]
+struct RequestOptions {
+  headers: HeaderMap,
+}
+#[derive(Deserialize)]
+struct Message {
+  cmd: String,
+  callback: CallbackFn,
+  error: CallbackFn,
+  payload: serde_json::Map<String, JsonValue>,
+  options: Option<RequestOptions>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,8 +94,47 @@ impl AwesomeRpc {
       let params = params.parse::<InvokeRpcParams>().unwrap();
 
       if let Some(window) = handle.get_window(params.window_label.as_str()) {
-        let payload = serde_json::from_str::<InvokePayload>(params.payload.as_str()).unwrap();
-        let _ = window.on_message(payload);
+        let message = serde_json::from_str::<Message>(params.payload.as_str()).unwrap();
+        window.on_message(
+          InvokeRequest {
+            cmd: message.cmd.clone(),
+            callback: message.callback,
+            error: message.error,
+            body: InvokeBody::Json(message.payload.into()),
+            headers: message.options.map(|o| o.headers.0).unwrap_or_default(),
+          },
+          Box::new(move |window, _cmd, response, _callback, _error| {
+            #[derive(Serialize, Deserialize)]
+            struct JsonRpcResponse {
+              jsonrpc: String,
+              id: usize,
+              result: RpcResult,
+            }
+
+            let result = match response {
+              InvokeResponse::Ok(InvokeBody::Json(r)) => RpcResult {
+                status: RpcResponseStatus::Success,
+                data: r.clone(),
+              },
+              InvokeResponse::Ok(InvokeBody::Raw(r)) => RpcResult {
+                status: RpcResponseStatus::Success,
+                data: JsonValue::String(std::str::from_utf8(&r.to_owned()).unwrap().to_string()),
+              },
+              InvokeResponse::Err(e) => RpcResult {
+                status: RpcResponseStatus::Error,
+                data: e.0.clone(),
+              },
+            };
+
+            let r = JsonRpcResponse {
+              jsonrpc: "2.0".into(),
+              id: params.id,
+              result,
+            };
+
+            window.state::<AwesomeEmit>().send(r);
+          }),
+        );
 
         return Ok(json!(RpcResult {
           status: RpcResponseStatus::Processing,
@@ -76,38 +159,11 @@ impl AwesomeRpc {
   }
 
   pub fn responder<R: Runtime>() -> Box<InvokeResponder<R>> {
-    let responder = move |window: Window<R>,
-                          response: InvokeResponse,
-                          callback: CallbackFn,
-                          error: CallbackFn| {
-      let response = response.into_result();
-
-      #[derive(Serialize, Deserialize)]
-      struct JsonRpcResponse {
-        jsonrpc: String,
-        id: usize,
-        result: RpcResult,
-      }
-
-      let result = match response {
-        Ok(r) => RpcResult {
-          status: RpcResponseStatus::Success,
-          data: r,
-        },
-        Err(e) => RpcResult {
-          status: RpcResponseStatus::Error,
-          data: e,
-        },
-      };
-
-      let r = JsonRpcResponse {
-        jsonrpc: "2.0".into(),
-        id: callback.0 + error.0,
-        result,
-      };
-
-      window.state::<AwesomeEmit>().send(r);
-    };
+    let responder = |_window: &Window<R>,
+                     _cmd: &str,
+                     _response: &InvokeResponse,
+                     _callback: CallbackFn,
+                     _error: CallbackFn| {};
 
     Box::new(responder)
   }
@@ -115,10 +171,12 @@ impl AwesomeRpc {
   pub fn initialization_script(&self) -> String {
     format!(
       "
-      Object.defineProperty(window, '__TAURI_POST_MESSAGE__', {{
+      let globalId = 0;
+      Object.defineProperty(window.__TAURI_INTERNALS__, 'postMessage', {{
         value: (message) => {{
           const ws = new WebSocket('ws://localhost:{}', \"json\");
-          const rpcMethodId = message.callback + message.error;
+          const rpcMethodId = globalId;
+          globalId += 1;
 
           ws.onmessage = function (event) {{
             let rpcMessage = JSON.parse(event.data);
@@ -138,24 +196,23 @@ impl AwesomeRpc {
             }}
           }};
 
-        ws.onerror = (e) => {{
-          ws.close();
-          window[`_${{message.error}}`](e)
-          delete window[`_${{message.error}}`];
-        }};
+          ws.onerror = (e) => {{
+            ws.close();
+            window[`_${{message.error}}`](e)
+            delete window[`_${{message.error}}`];
+          }};
 
 
-        ws.onopen = () => {{
-          ws.send(
-            JSON.stringify({{
-              jsonrpc: \"2.0\",
-              id: rpcMethodId,
-              method: \"invoke\",
-              params: {{window_label: window.__TAURI_METADATA__.__currentWindow.label, payload: JSON.stringify(message) }},
-            }})
-          );
-        }};
-
+          ws.onopen = () => {{
+            ws.send(
+              JSON.stringify({{
+                jsonrpc: \"2.0\",
+                id: rpcMethodId,
+                method: \"invoke\",
+                params: {{id: rpcMethodId, window_label: window.__TAURI_INTERNALS__.metadata.currentWindow.label, payload: JSON.stringify(message) }},
+              }})
+            );
+          }};
         }}
       }});
 
@@ -167,7 +224,7 @@ impl AwesomeRpc {
             ws.onmessage = function (event) {{
               let message = JSON.parse(event.data);
 
-              if (message.event_name && message.event_name === event_name && [null, window.__TAURI_METADATA__.__currentWindow.label].includes(message.window_label)) {{
+              if (message.event_name && message.event_name === event_name && [null, window.__TAURI_INTERNALS__.metadata.currentWindow].includes(message.window_label)) {{
                 callback(message.payload);
               }}
             }};
