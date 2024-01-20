@@ -1,5 +1,9 @@
 # 😎 tauri-awesome-rpc
 
+> This repo forked from `https://github.com/ahkohd/tauri-awesome-rpc`, I make it compatible with `tauri 2.0-alpha`.
+But unfortunately, ws cant fix `tauri` invoke memory leak (https://github.com/tauri-apps/tauri/issues/4026). 
+There are many performance works to do in this repo. But need upstream fix the memory leak problem before.
+
 This is a crate provides a custom invoke system for Tauri using a localhost JSON RPC WebSocket.
 Each message is delivered through Websocket using JSON RPC 2.0 [specification](https://www.jsonrpc.org/specification).
 
@@ -11,7 +15,7 @@ First, add the dependency to your `src-tauri/Cargo.toml` file:
 
 ```
 [dependencies]
-tauri-awesome-rpc = { git = "https://github.com/ahkohd/tauri-awesome-rpc", branch = "dev" }
+tauri-awesome-rpc = { git = "https://github.com/Miloas/tauri-awesome-rpc", branch = "dev" }
 ```
 
 Then, setup the Websocket JSON RPC invoke system on the `main.rs` file:
@@ -25,7 +29,11 @@ fn main() {
   #[cfg(dev)]
   let allowed_domain = {
     let config: tauri_utils::config::Config = serde_json::from_value(
-      tauri_utils::config::parse::read_from(std::env::current_dir().unwrap()).unwrap(),
+      tauri_utils::config::parse::read_from(
+        tauri_utils::platform::Target::current(),
+        std::env::current_dir().unwrap(),
+      )
+      .unwrap(),
     )
     .unwrap();
     config.build.dev_path.to_string()
@@ -39,7 +47,7 @@ fn main() {
   tauri::Builder::default()
     .invoke_system(awesome_rpc.initialization_script(), AwesomeRpc::responder())
     .setup(move |app| {
-      awesome_rpc.start(app.handle());
+      awesome_rpc.start(app.handle().clone());
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![test_command, report_time_elapsed])
